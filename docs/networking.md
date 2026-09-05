@@ -25,23 +25,48 @@ control layer:
 |---|---|---|
 | `127.0.0.1` | Host-only. Never reachable off-box. | Private metasearch, vehicle command proxy, both Postgres instances, tunnel daemon |
 | `<tailnet IP>` | Reachable from enrolled devices only. | Web dashboard, metrics, automation UI, vehicle telemetry UI |
-| `0.0.0.0` | All interfaces — requires a reason. | `sshd`; the API |
+| `0.0.0.0` | All interfaces — requires a reason, and the API's is below. | `sshd`; the API |
 
 Binding a database to `127.0.0.1` rather than `0.0.0.0` is the cheapest security
 control available, and it is applied by default. Postgres containers publish to
 loopback only; nothing reaches them except the service that owns them.
 
-### A known item, stated plainly
+### The API binds broadly on purpose, and is guarded in-process
 
-The API currently binds `0.0.0.0:8000` rather than the tailnet interface. In
-practice it is reached over the mesh, but a broad bind means the listener is
-also offered to whatever physical LAN the host sits on, and it should be
-narrowed to the tailnet address to match everything else.
+The API listens on `0.0.0.0:8000`, which by itself would offer it to the
+physical LAN. It is not narrowed, because binding is all-or-one — `uvicorn`
+takes a single `--host` — and eleven internal callers reach the API over
+`127.0.0.1`. Rebinding to the tailnet address would break every one of them.
 
-I am listing this rather than describing the system as tighter than it is. When
-I tried to verify it by connecting from another machine on a different subnet, I
-got no route — which proves nothing about the local LAN, so it does not count as
-evidence. An unverified control is not a control.
+The textbook fix is an `nftables` rule scoped to the `tailscale0` interface.
+That is unavailable here: there is no passwordless sudo on this host and the
+unit files live under `/etc/systemd/system`.
+
+So the perimeter is enforced **in-process**, as the outermost middleware, ahead
+of any handler or logging work. A request is served only if its source is
+loopback, `100.64.0.0/10` (the CGNAT block Tailscale allocates from), or
+Tailscale's IPv6 ULA prefix. Everything else gets a 403 and a logged warning.
+Loopback stays reachable for internal callers; the LAN does not.
+
+Two details that matter more than the rule itself:
+
+- **It fails closed.** A missing or unparseable client address is refused, not
+  waved through. The one thing a perimeter must never do is guess.
+- **`/healthz` and `/ping` stay open**, so a blocked client can still tell
+  "the server is down" from "you are not on the tailnet." A perimeter that
+  makes those two indistinguishable costs you an hour of misdiagnosis.
+
+An `HAVEN_ALLOW_ALL_IPS=1` escape hatch exists for the case where the guard
+misjudges a legitimate client. It is off, and the test suite asserts that it is
+off — an escape hatch nobody checks is just a hole with better manners.
+
+This guard shipped on 2026-07-29 and had **no test until September**, which
+is its own lesson: the control existed and nothing proved it could refuse. It
+now has 28, including LAN and public addresses being denied, the CGNAT block
+boundaries, malformed input failing closed, and — the one that matters most —
+an assertion that the middleware is actually *registered*, not merely defined.
+A guard nothing installs is the exact failure mode described in
+[observability](observability.md).
 
 ## Egress
 
